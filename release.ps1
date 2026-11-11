@@ -70,7 +70,7 @@ if (-not $Notes) { $Notes = "Версия $version" }
 
 $manifest = [ordered]@{
     version = $version
-    zip = "https://i-lednev.github.io/opencode-deepseek-pills/opencode-transfer.zip"
+    zip = "https://raw.githubusercontent.com/I-Lednev/opencode-deepseek-pills/main/docs/opencode-transfer.zip"
     sha256 = $hash
     size = (Get-Item $zip).Length
     notes = $Notes
