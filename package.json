@@ -1,0 +1,28 @@
+{
+    "name":  "opencode-deepseek-pills",
+    "version":  "1.2.0",
+    "description":  "OpenCode Desktop pills: DeepSeek balance, spend, tariff, top-up rate and CBR rate.",
+    "type":  "module",
+    "exports":  {
+                    ".":  "./src/index.js",
+                    "./gui-experimental":  "./src/gui-experimental.cjs"
+                },
+    "files":  [
+                  "src",
+                  "scripts",
+                  "commands",
+                  "install.ps1",
+                  "README.md"
+              ],
+    "keywords":  [
+                     "opencode",
+                     "opencode-plugin",
+                     "deepseek",
+                     "balance",
+                     "cbr"
+                 ],
+    "license":  "MIT",
+    "dependencies":  {
+                         "@opencode/plugin":  "latest"
+                     }
+}
