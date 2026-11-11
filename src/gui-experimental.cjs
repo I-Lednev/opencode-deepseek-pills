@@ -9,7 +9,7 @@ const { Schema } = require("effect")
 const CNY_PER_USD = 6.6854
 
 // Версия плагина и адрес манифеста обновлений на GitHub Pages.
-const PLUGIN_VERSION = "1.2.0"
+const PLUGIN_VERSION = "1.3.0"
 const UPDATE_MANIFEST_URL = "https://i-lednev.github.io/opencode-deepseek-pills/version.json"
 const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1000
 
@@ -154,10 +154,19 @@ const Status = Ipc.define({
     updateNotes: Schema.String,
     updateCheckedAt: Schema.String,
     updateError: Schema.String,
+    updateSha: Schema.String,
+    updating: Schema.Boolean,
+    updateProgress: Schema.Number,
+    updateMessage: Schema.String,
+    updateFrom: Schema.String,
+    updateTo: Schema.String,
+    autoUpdate: Schema.Boolean,
   }),
   methods: {
     refresh: {},
     checkUpdate: {},
+    installUpdate: {},
+    toggleAutoUpdate: {},
   },
 })
 
@@ -218,17 +227,25 @@ function formatRubAmount(value) {
   return `${n.toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ₽`
 }
 
+function currencySymbol(currency) {
+  if (currency === "RUB") return "₽"
+  if (currency === "USD") return "$"
+  return "¥"
+}
+
 function formatMoney(value, currency) {
   const n = Number(value)
-  if (!Number.isFinite(n)) return currency === "RUB" ? "0,00 ₽" : "¥0.00"
+  if (!Number.isFinite(n)) return currency === "RUB" ? "0,00 ₽" : `${currencySymbol(currency)}0.00`
   if (currency === "RUB") return formatRubAmount(n)
+  if (currency === "USD") return `$${n.toFixed(2)}`
   return `¥${n >= 0.1 ? n.toFixed(2) : n.toFixed(3)}`
 }
 
 function formatMoneyShort(value, currency) {
   const n = Number(value)
-  if (!Number.isFinite(n)) return currency === "RUB" ? "0 ₽" : "¥0.00"
+  if (!Number.isFinite(n)) return currency === "RUB" ? "0 ₽" : `${currencySymbol(currency)}0.00`
   if (currency === "RUB") return `${Math.round(n).toLocaleString("ru-RU")} ₽`
+  if (currency === "USD") return `$${n.toFixed(2)}`
   return `¥${n >= 0.1 ? n.toFixed(2) : n.toFixed(3)}`
 }
 
@@ -629,28 +646,47 @@ function adviceLabel(state) {
 
 function buildRows(state, usd, daily, todayUsd, display) {
   const rows = []
-  const currency = display && display.currency === "RUB" ? "RUB" : "CNY"
+  const order = ["RUB", "CNY", "USD"]
+  const requested = display && order.includes(display.currency) ? display.currency : "CNY"
   const setCurrency = display && typeof display.setCurrency === "function" ? display.setCurrency : null
   const canRub = state.cbr > 0 && state.rate > 0
-  const useRub = currency === "RUB" && canRub
+  const currency = requested === "RUB" && !canRub ? "CNY" : requested
   const cnyToRub = canRub ? state.cbr / state.rate : 0
-  const rate = useRub ? state.cbr : state.rate
+  const cnyToUsd = state.rate > 0 ? 1 / state.rate : 0
+  const rate = currency === "RUB" ? state.cbr : currency === "USD" ? 1 : state.rate
+  const symbol = currencySymbol(currency)
+  const next = order[(order.indexOf(currency) + 1) % order.length]
 
   const balances = parseBalances(state.detail)
   const cnyBalance = balances.find((balance) => balance.currency === "CNY")
+  const cny = cnyBalance ? Number(cnyBalance.total) : 0
 
-  if (useRub && cnyBalance) {
-    const cny = Number(cnyBalance.total)
+  if (cny > 0) {
+    const value = currency === "RUB" ? cny * cnyToRub : currency === "USD" ? cny * cnyToUsd : cny
+    const others = []
+
+    if (currency !== "CNY") others.push(`¥${cny.toFixed(2)}`)
+    if (currency !== "USD") others.push(`$${(cny * cnyToUsd).toFixed(2)}`)
+    if (currency !== "RUB" && canRub) others.push(formatRubAmount(cny * cnyToRub))
+
+    const rateText =
+      currency === "RUB"
+        ? `курс ${formatNumber(cnyToRub, 2)} ₽/¥ (ЦБ)`
+        : currency === "USD"
+          ? `курс ${formatNumber(state.rate, 4)} ¥/$`
+          : ""
+
     rows.push({
       id: "balance",
-      label: `Баланс: ${formatRubAmount(cny * cnyToRub)}`,
-      detail: `¥${cny.toFixed(2)} · курс ${formatNumber(cnyToRub, 2)} ₽/¥ (ЦБ)`,
+      label: `Баланс: ${formatMoney(value, currency)}`,
+      detail: [others.join(" · "), rateText].filter(Boolean).join(" · "),
     })
   } else {
     for (const balance of balances) {
+      const symbol = balance.currency === "CNY" ? "¥" : balance.currency === "USD" ? "$" : balance.currency
       rows.push({
         id: balance.currency,
-        label: `${balance.currency} ${balance.total}`,
+        label: `${symbol}${balance.total}`,
         detail: `пополнено ${balance.toppedUp} · бонусы ${balance.granted}`,
       })
     }
@@ -658,27 +694,29 @@ function buildRows(state, usd, daily, todayUsd, display) {
 
   rows.push({
     id: "currency",
-    label: useRub ? "Валюта: ₽ рубли" : "Валюта: ¥ юани",
-    detail: useRub
-      ? `курс ЦБ ${formatNumber(state.cbr, 2)} ₽/$ · нажмите для юаней`
-      : canRub
-        ? "нажмите, чтобы перевести в рубли"
-        : "курс ЦБ ещё не загружен",
-    run: canRub && setCurrency ? () => setCurrency(useRub ? "CNY" : "RUB") : undefined,
+    label: `Валюта: ${symbol}`,
+    detail: `${order.map(currencySymbol).join(" · ")} · нажмите для ${currencySymbol(next)}`,
+    run: setCurrency ? () => setCurrency(next) : undefined,
   })
 
   if (state.rate > 0 && usd !== null) {
     const sessionValue = usd * rate
     const todayValue = (todayUsd || 0) * rate
+    const rateText =
+      currency === "RUB"
+        ? `курс ${formatNumber(state.cbr, 2)} ₽/$`
+        : currency === "USD"
+          ? "в долларах"
+          : `фикс. курс ${state.rate.toFixed(4)} ¥/$`
 
     rows.push({
       id: "session",
-      label: `Расход за всё время ≈ −${formatMoney(sessionValue, useRub ? "RUB" : "CNY")}`,
-      detail: `$${usd.toFixed(4)} · сессия · ${useRub ? `курс ${formatNumber(state.cbr, 2)} ₽/$` : `фикс. курс ${state.rate.toFixed(4)}`}`,
+      label: `Расход за всё время ≈ −${formatMoney(sessionValue, currency)}`,
+      detail: `$${usd.toFixed(4)} · сессия · ${rateText}`,
     })
     rows.push({
       id: "today",
-      label: `Сегодня ≈ −${formatMoney(todayValue, useRub ? "RUB" : "CNY")}`,
+      label: `Сегодня ≈ −${formatMoney(todayValue, currency)}`,
       detail: `за ${formatShortDate(localDateKey(new Date()))} · по сообщениям сессии`,
     })
   }
@@ -690,10 +728,7 @@ function buildRows(state, usd, daily, todayUsd, display) {
     if (total > 0 && chart) {
       const spendDays = daily.filter((point) => point.usd > 0).slice(-3)
       const summary = spendDays
-        .map(
-          (point) =>
-            `${formatShortDate(point.date)}: ${formatMoney(point.usd * rate, useRub ? "RUB" : "CNY")}`,
-        )
+        .map((point) => `${formatShortDate(point.date)}: ${formatMoney(point.usd * rate, currency)}`)
         .join(" · ")
 
       rows.push({
@@ -873,6 +908,103 @@ const definition = Plugin.define({
     const [displayCurrency, setDisplayCurrency] = createSignal("CNY")
     const tick = setInterval(() => setNow(Date.now()), 15000)
 
+    let updateOverlay = null
+    let updateOverlayTimer = null
+    let updateOverlayDone = 0
+
+    const ensureUpdateOverlay = () => {
+      if (typeof document === "undefined" || !document.body) return null
+      if (updateOverlay && document.body.contains(updateOverlay)) return updateOverlay
+
+      const overlay = document.createElement("div")
+      overlay.style.cssText = [
+        "position: fixed",
+        "right: 18px",
+        "bottom: 18px",
+        "z-index: 2147483646",
+        "width: 340px",
+        "max-width: calc(100vw - 36px)",
+        "padding: 14px 16px",
+        "border-radius: 12px",
+        "border: 1px solid #334155",
+        "background: rgba(15, 23, 42, 0.97)",
+        "color: #e5e7eb",
+        "box-shadow: 0 18px 50px rgba(0,0,0,.45)",
+        "font: 13px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif",
+        "pointer-events: none",
+        "display: none",
+      ].join(";")
+
+      const title = document.createElement("div")
+      title.textContent = "Обновление плагина"
+      title.style.cssText = "font-weight: 650; font-size: 14px; margin-bottom: 4px;"
+
+      const versions = document.createElement("div")
+      versions.style.cssText = "color: #93c5fd; margin-bottom: 8px;"
+
+      const notes = document.createElement("div")
+      notes.style.cssText =
+        "color: #94a3b8; white-space: pre-line; max-height: 84px; overflow: hidden; margin-bottom: 10px;"
+
+      const barOuter = document.createElement("div")
+      barOuter.style.cssText =
+        "height: 6px; border-radius: 999px; background: #334155; overflow: hidden;"
+
+      const barInner = document.createElement("div")
+      barInner.style.cssText =
+        "height: 100%; width: 0%; background: #60a5fa; transition: width .25s ease;"
+      barOuter.appendChild(barInner)
+
+      const message = document.createElement("div")
+      message.style.cssText = "margin-top: 8px; color: #cbd5e1; font-size: 12px;"
+
+      overlay.appendChild(title)
+      overlay.appendChild(versions)
+      overlay.appendChild(notes)
+      overlay.appendChild(barOuter)
+      overlay.appendChild(message)
+      document.body.appendChild(overlay)
+
+      updateOverlay = overlay
+      overlay._refs = { versions, notes, barInner, message }
+      return overlay
+    }
+
+    const renderUpdateOverlay = () => {
+      if (typeof document === "undefined") return
+      const state = client.state()
+      const overlay = ensureUpdateOverlay()
+      if (!overlay) return
+
+      if (!state || !state.updating) {
+        if (state && state.updateProgress >= 100 && state.updateMessage) {
+          if (!updateOverlayDone) updateOverlayDone = Date.now()
+          if (Date.now() - updateOverlayDone < 8000) {
+            overlay.style.display = "block"
+            overlay._refs.versions.textContent = `${state.updateFrom || state.version} → ${state.updateTo || state.latestVersion}`
+            overlay._refs.notes.textContent = state.updateNotes || ""
+            overlay._refs.barInner.style.width = "100%"
+            overlay._refs.message.textContent = state.updateMessage
+            return
+          }
+        }
+
+        overlay.style.display = "none"
+        updateOverlayDone = 0
+        return
+      }
+
+      updateOverlayDone = 0
+      overlay.style.display = "block"
+      overlay._refs.versions.textContent = `${state.updateFrom || state.version} → ${state.updateTo || state.latestVersion}`
+      overlay._refs.notes.textContent = state.updateNotes || ""
+      overlay._refs.barInner.style.width = `${Math.max(0, Math.min(100, Number(state.updateProgress) || 0))}%`
+      overlay._refs.message.textContent = `${state.updateMessage || ""}${state.updateProgress ? ` · ${Math.round(state.updateProgress)}%` : ""}`
+    }
+
+    updateOverlayTimer = setInterval(renderUpdateOverlay, 500)
+    renderUpdateOverlay()
+
     try {
       ctx.add(Style, PILL_STYLE)
     } catch (error) {
@@ -891,14 +1023,59 @@ const definition = Plugin.define({
         .map((point) => `${point.date}:${point.rate}:${point.ts || 0}`)
         .join(",")}`
 
-      const spans = Array.from(row.querySelectorAll("span"))
-      let label = spans.find((span) => (span.textContent || "").trim() === expected)
+      const fullText = points
+        .map(
+          (point) =>
+            `${formatShortDate(point.date)}: ${formatPrice(point.rate, dataset.digits)} ${dataset.unit}`,
+        )
+        .join(" · ")
+
+      if (!row.dataset.chartHover) {
+        row.addEventListener("mouseenter", (event) =>
+          showChartTooltip(fullText, event.clientX, event.clientY),
+        )
+        row.addEventListener("mousemove", (event) =>
+          positionChartTooltip(event.clientX, event.clientY),
+        )
+        row.addEventListener("mouseleave", hideChartTooltip)
+        row.dataset.chartHover = "1"
+      }
+
+      let label = Array.from(row.querySelectorAll("*")).find(
+        (element) => element.children.length === 0 && (element.textContent || "").trim() === expected,
+      )
+
+      if (!label && typeof document.createTreeWalker === "function") {
+        const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT)
+        let node
+
+        while ((node = walker.nextNode())) {
+          const text = node.nodeValue || ""
+          if (text.trim() !== expected && !text.includes(expected)) continue
+
+          const container = document.createElement("span")
+          container.style.display = "inline-block"
+          const parent = node.parentNode
+          if (!parent) continue
+
+          if (text.trim() === expected) {
+            parent.replaceChild(container, node)
+          } else {
+            const parts = text.split(expected)
+            parent.insertBefore(document.createTextNode(parts[0]), node)
+            parent.insertBefore(container, node)
+            parent.insertBefore(document.createTextNode(parts.slice(1).join(expected)), node)
+            parent.removeChild(node)
+          }
+
+          label = container
+          break
+        }
+      }
 
       if (!label && datasetKey === "session") {
         const first = row.firstElementChild
-        if (first && first.tagName === "SPAN" && !(first.textContent || "").includes("расход по дням")) {
-          label = first
-        }
+        if (first && (first.textContent || "").trim() === expected) label = first
       }
 
       if (!label) return
@@ -1042,19 +1219,31 @@ const definition = Plugin.define({
           const daily = sessionDailySpend(input.session)
           const todayUsd = sessionSpendToday(daily)
           const canRub = state.cbr > 0 && state.rate > 0
-          const useRub = displayCurrency() === "RUB" && canRub
-          const currency = useRub ? "RUB" : "CNY"
-          const rate = useRub ? state.cbr : state.rate
+          const requested = displayCurrency()
+          const currency =
+            requested === "RUB" && !canRub
+              ? "CNY"
+              : requested === "USD"
+                ? "USD"
+                : requested === "RUB"
+                  ? "RUB"
+                  : "CNY"
+          const rate = currency === "RUB" ? state.cbr : currency === "USD" ? 1 : state.rate
+          const cnyToRub = canRub ? state.cbr / state.rate : 0
+          const cnyToUsd = state.rate > 0 ? 1 / state.rate : 0
 
           const balances = parseBalances(state.detail)
           const cnyBalance = Number(
             (balances.find((balance) => balance.currency === "CNY") || {}).total || 0,
           )
-          const cnyToRub = canRub ? state.cbr / state.rate : 0
+          const balanceValue =
+            currency === "RUB"
+              ? cnyBalance * cnyToRub
+              : currency === "USD"
+                ? cnyBalance * cnyToUsd
+                : cnyBalance
           const balanceLabel =
-            useRub && cnyBalance > 0
-              ? `DS ${formatMoneyShort(cnyBalance * cnyToRub, "RUB")}`
-              : state.label
+            cnyBalance > 0 ? `DS ${formatMoneyShort(balanceValue, currency)}` : state.label
 
           const spend = state.rate > 0 && usd !== null ? `−${formatMoney(usd * rate, currency)}` : null
           const today = state.rate > 0 && usd !== null ? `−${formatMoney(todayUsd * rate, currency)}` : null
@@ -1063,7 +1252,7 @@ const definition = Plugin.define({
           const todayShort =
             state.rate > 0 && usd !== null ? `−${formatMoneyShort(todayUsd * rate, currency)}` : null
           const label = [balanceLabel, spendShort, todayShort].filter(Boolean).join(" · ")
-          const chartUnit = useRub ? "₽" : "¥"
+          const chartUnit = currencySymbol(currency)
 
           if (state.rate > 0 && daily.length > 0) {
             setChartPoints(
@@ -1095,30 +1284,42 @@ const definition = Plugin.define({
           rows.unshift({
             id: "version",
             label: `Версия плагина: ${state.version || PLUGIN_VERSION}`,
-            detail: state.updateChecking
-              ? "проверяем обновление…"
-              : state.updateError
-                ? "проверка не удалась"
-                : state.updateAvailable
-                  ? `доступна ${state.latestVersion}`
-                  : state.updateCheckedAt
-                    ? "обновлений нет"
-                    : "проверка ещё не выполнялась",
+            detail: state.updating
+              ? "идёт обновление"
+              : state.updateChecking
+                ? "проверяем обновление…"
+                : state.updateError
+                  ? "проверка не удалась"
+                  : state.updateAvailable
+                    ? `доступна ${state.latestVersion}`
+                    : state.updateCheckedAt
+                      ? "обновлений нет"
+                      : "проверка ещё не выполнялась",
           })
 
-          if (state.updateAvailable) {
+          if (state.updating) {
+            rows.push({
+              id: "update-progress",
+              label: `Обновление ${state.updateFrom} → ${state.updateTo}`,
+              detail: `${state.updateMessage || "идёт обновление"} · ${Math.round(state.updateProgress)}%`,
+            })
+          } else if (state.updateAvailable) {
             rows.push({
               id: "update-available",
               label: `Обновить до ${state.latestVersion}`,
-              detail: state.updateNotes || "открыть страницу загрузки",
-              run: () =>
-                openExternalUrl(
-                  ctx,
-                  state.updateUrl ||
-                    "https://github.com/i-lednev/opencode-deepseek-pills/releases/latest",
-                ),
+              detail: state.updateNotes
+                ? state.updateNotes.split("\n")[0].slice(0, 120)
+                : "скачать и установить автоматически",
+              run: () => void client.installUpdate().catch(() => {}),
             })
           }
+
+          rows.push({
+            id: "auto-update",
+            label: `Автообновление: ${state.autoUpdate ? "вкл" : "выкл"}`,
+            detail: state.autoUpdate ? "новые версии ставятся сами" : "только по кнопке",
+            run: () => void client.toggleAutoUpdate().catch(() => {}),
+          })
 
           rows.push({
             id: "check-update",
@@ -1408,11 +1609,15 @@ const definition = Plugin.define({
       if (typeof window !== "undefined") window.removeEventListener("blur", hideOnLeave)
       if (chartTooltip && chartTooltip.parentNode) chartTooltip.parentNode.removeChild(chartTooltip)
       chartTooltip = null
+      if (updateOverlayTimer) clearInterval(updateOverlayTimer)
+      if (updateOverlay && updateOverlay.parentNode) updateOverlay.parentNode.removeChild(updateOverlay)
+      updateOverlay = null
     }
   },
 
   main(ctx) {
     const { execFile } = require("node:child_process")
+    const crypto = require("node:crypto")
     const fs = require("node:fs")
     const os = require("node:os")
     const path = require("node:path")
@@ -1574,12 +1779,20 @@ const definition = Plugin.define({
       updateNotes: "",
       updateCheckedAt: "",
       updateError: "",
+      updateSha: "",
+      updating: false,
+      updateProgress: 0,
+      updateMessage: "",
+      updateFrom: PLUGIN_VERSION,
+      updateTo: "",
+      autoUpdate: true,
     }
     let provider
     let balanceTimer
     let rateTimer
     let cbrTimer
     let updateTimer
+    let autoUpdateTimer
 
     function saveDebug() {
       try {
@@ -1600,6 +1813,56 @@ const definition = Plugin.define({
           (error, stdout, stderr) => resolve({ error, stdout, stderr }),
         )
       })
+    }
+
+    function runPowerShell(args, timeout) {
+      return new Promise((resolve) => {
+        execFile(
+          "powershell.exe",
+          ["-NoProfile", "-ExecutionPolicy", "Bypass"].concat(args),
+          { timeout: timeout || 120000, windowsHide: true },
+          (error, stdout, stderr) => resolve({ error, stdout, stderr }),
+        )
+      })
+    }
+
+    function findFile(dir, name) {
+      try {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, entry.name)
+          if (entry.isDirectory()) {
+            const found = findFile(full, name)
+            if (found) return found
+          } else if (entry.name.toLowerCase() === name.toLowerCase()) {
+            return full
+          }
+        }
+      } catch {}
+
+      return null
+    }
+
+    function findCli() {
+      const local = path.join(
+        process.env.LOCALAPPDATA || "",
+        "Programs",
+        "ai.opencode.desktop",
+        "resources",
+        "opencode-cli.exe",
+      )
+      if (fs.existsSync(local)) return local
+      return "opencode-cli.exe"
+    }
+
+    function setUpdate(progress, message) {
+      snapshot = {
+        ...snapshot,
+        updating: true,
+        updateProgress: progress,
+        updateMessage: message,
+      }
+      provider.changed()
+      saveDebug()
     }
 
     async function refreshBalance() {
@@ -1747,6 +2010,9 @@ const definition = Plugin.define({
           updateCheckedAt: new Date().toISOString(),
           updateError: "",
           updateChecking: false,
+          updateSha: String(data.sha256 || "").trim(),
+          updateFrom: PLUGIN_VERSION,
+          updateTo: latest,
         }
       } catch (error) {
         snapshot = {
@@ -1757,6 +2023,138 @@ const definition = Plugin.define({
         }
       }
 
+      provider.changed()
+      saveDebug()
+
+      if (snapshot.updateAvailable && snapshot.autoUpdate && !snapshot.updating) {
+        if (autoUpdateTimer) clearTimeout(autoUpdateTimer)
+        autoUpdateTimer = setTimeout(() => void installUpdate(), 5000)
+      }
+    }
+
+    async function installUpdate() {
+      if (snapshot.updating) return
+      if (!snapshot.updateUrl) {
+        snapshot = { ...snapshot, updateError: "Нет ссылки на обновление" }
+        provider.changed()
+        return
+      }
+
+      const from = PLUGIN_VERSION
+      const to = snapshot.latestVersion || "?"
+      const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14)
+      const configDir = path.join(process.env.USERPROFILE || "", ".config", "opencode")
+      const pluginDir = path.join(configDir, "deepseek-balance-plugin")
+      const tempZip = path.join(os.tmpdir(), `opencode-pills-${stamp}.zip`)
+      const tempDir = path.join(os.tmpdir(), `opencode-pills-${stamp}`)
+      let oldPlugin = null
+      let installed = false
+
+      try {
+        setUpdate(3, `Скачивание ${to}...`)
+
+        const response = await fetch(snapshot.updateUrl, {
+          signal: AbortSignal.timeout(120000),
+        })
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+
+        const buffer = Buffer.from(await response.arrayBuffer())
+        const hash = crypto.createHash("sha256").update(buffer).digest("hex")
+        if (snapshot.updateSha && hash.toLowerCase() !== snapshot.updateSha.toLowerCase()) {
+          throw new Error("sha256 не совпал")
+        }
+        fs.writeFileSync(tempZip, buffer)
+
+        setUpdate(25, "Распаковка...")
+        fs.mkdirSync(tempDir, { recursive: true })
+        const expand = await runPowerShell([
+          "-Command",
+          `Expand-Archive -LiteralPath '${tempZip}' -DestinationPath '${tempDir}' -Force`,
+        ])
+        if (expand.error) throw new Error(String(expand.stderr || expand.error.message).trim())
+
+        const installer = findFile(tempDir, "install.ps1")
+        if (!installer) throw new Error("в архиве нет install.ps1")
+
+        setUpdate(40, "Бэкап конфига...")
+        const backupDir = `${configDir}.backup-${stamp}`
+        try {
+          fs.cpSync(configDir, backupDir, { recursive: true })
+        } catch {
+          await runPowerShell([
+            "-Command",
+            `Copy-Item -Recurse -Force -LiteralPath '${configDir}' -Destination '${backupDir}'`,
+          ])
+        }
+
+        setUpdate(55, "Выгрузка текущей версии...")
+        if (fs.existsSync(pluginDir)) {
+          oldPlugin = `${pluginDir}.old-${stamp}`
+          fs.renameSync(pluginDir, oldPlugin)
+        }
+
+        setUpdate(65, `Установка ${to}...`)
+        const install = await runPowerShell([
+          "-File",
+          installer,
+          "-SkipSessionImport",
+          "-ReplaceHistory",
+        ], 180000)
+        if (install.error) throw new Error(String(install.stderr || install.error.message).trim())
+        installed = true
+
+        setUpdate(85, "Перезагрузка OpenCode...")
+        const cli = findCli()
+        if (cli) {
+          await runPowerShell(["-Command", `& '${cli}' reload`], 60000)
+        }
+
+        snapshot = {
+          ...snapshot,
+          updating: false,
+          updateProgress: 100,
+          updateMessage: "Готово. Нажмите Ctrl+R",
+          updateAvailable: false,
+          updateError: "",
+          version: to,
+          latestVersion: to,
+          updateFrom: from,
+          updateTo: to,
+        }
+      } catch (error) {
+        const message = String(error && error.message ? error.message : error).trim()
+
+        if (!installed && oldPlugin && fs.existsSync(oldPlugin)) {
+          try {
+            if (fs.existsSync(pluginDir)) {
+              fs.renameSync(pluginDir, `${pluginDir}.failed-${stamp}`)
+            }
+            fs.renameSync(oldPlugin, pluginDir)
+          } catch {}
+        }
+
+        snapshot = {
+          ...snapshot,
+          updating: false,
+          updateProgress: 0,
+          updateMessage: "Ошибка обновления",
+          updateError: message,
+        }
+      }
+
+      provider.changed()
+      saveDebug()
+    }
+
+    function toggleAutoUpdate() {
+      snapshot = { ...snapshot, autoUpdate: !snapshot.autoUpdate }
+      if (autoUpdateTimer) {
+        clearTimeout(autoUpdateTimer)
+        autoUpdateTimer = null
+      }
+      if (snapshot.autoUpdate && snapshot.updateAvailable && !snapshot.updating) {
+        autoUpdateTimer = setTimeout(() => void installUpdate(), 1000)
+      }
       provider.changed()
       saveDebug()
     }
@@ -1774,6 +2172,12 @@ const definition = Plugin.define({
       },
       checkUpdate() {
         return checkUpdate()
+      },
+      installUpdate() {
+        return installUpdate()
+      },
+      toggleAutoUpdate() {
+        return toggleAutoUpdate()
       },
     })
 
@@ -1795,6 +2199,7 @@ const definition = Plugin.define({
       if (rateTimer) clearInterval(rateTimer)
       if (cbrTimer) clearInterval(cbrTimer)
       if (updateTimer) clearInterval(updateTimer)
+      if (autoUpdateTimer) clearTimeout(autoUpdateTimer)
     }
   },
 })
