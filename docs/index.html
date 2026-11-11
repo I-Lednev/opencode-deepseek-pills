@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenCode DeepSeek Pills</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: #0b1019;
+      color: #e5e7eb;
+    }
+    main { max-width: 760px; margin: 0 auto; padding: 48px 20px 80px; }
+    h1 { font-size: 32px; margin: 0 0 8px; }
+    h2 { font-size: 20px; margin: 32px 0 8px; }
+    p, li { color: #b6bec9; }
+    a { color: #6c9cff; }
+    code, pre {
+      background: #151c28;
+      border: 1px solid #263041;
+      border-radius: 8px;
+    }
+    code { padding: 2px 6px; }
+    pre { padding: 12px 14px; overflow: auto; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #1d2a44; color: #9db7ff; font-size: 13px; }
+    .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-top: 16px; }
+    .card { background: #111827; border: 1px solid #263041; border-radius: 12px; padding: 14px 16px; }
+    .card strong { color: #e5e7eb; }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="badge">OpenCode 2.2.1+</span>
+    <h1>OpenCode DeepSeek Pills</h1>
+    <p>Четыре пилюли для OpenCode Desktop: баланс и расход DeepSeek, тариф, курс пополнения plati и официальный курс ЦБ.</p>
+
+    <div class="grid">
+      <div class="card"><strong>Баланс</strong><br />¥ / ₽, расход сессии и за сегодня, график по дням.</div>
+      <div class="card"><strong>Тариф</strong><br />Дешёвое/дорогое время и обратный отсчёт.</div>
+      <div class="card"><strong>Пополнение</strong><br />Курс plati, наценка к ЦБ, прогноз и график.</div>
+      <div class="card"><strong>ЦБ</strong><br />Официальный USD/RUB, изменение и прогноз.</div>
+    </div>
+
+    <h2>Скачать</h2>
+    <p><a href="opencode-transfer.zip">opencode-transfer.zip</a> — плагин и установщик.</p>
+    <p><a href="version.json">version.json</a> — манифест обновлений.</p>
+
+    <h2>Установка</h2>
+    <pre><code>powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -SkipSessionImport</code></pre>
+    <p>После установки подключите DeepSeek API key в OpenCode и нажмите <code>Ctrl+R</code>.</p>
+
+    <h2>Обновление</h2>
+    <p>Плагин сам проверяет <code>version.json</code> при старте и раз в 6 часов. В меню первой пилюли есть строка версии и кнопка «Проверить обновление».</p>
+
+    <p><a href="https://github.com/I-Lednev/opencode-deepseek-pills">Исходники на GitHub</a></p>
+  </main>
+</body>
+</html>
