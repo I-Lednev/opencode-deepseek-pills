@@ -9,7 +9,7 @@ const { Schema } = require("effect")
 const CNY_PER_USD = 6.6854
 
 // Версия плагина и адрес манифеста обновлений на GitHub Pages.
-const PLUGIN_VERSION = "1.3.1"
+const PLUGIN_VERSION = "1.3.3"
 const UPDATE_MANIFEST_URL = "https://i-lednev.github.io/opencode-deepseek-pills/version.json"
 const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1000
 
@@ -165,7 +165,13 @@ const Status = Ipc.define({
   methods: {
     refresh: {},
     checkUpdate: {},
-    installUpdate: {},
+    installUpdate: {
+      input: Schema.Struct({
+        url: Schema.String,
+        sha256: Schema.String,
+        version: Schema.String,
+      }),
+    },
     toggleAutoUpdate: {},
   },
 })
@@ -249,9 +255,15 @@ function formatMoneyShort(value, currency) {
   return `¥${n >= 0.1 ? n.toFixed(2) : n.toFixed(3)}`
 }
 
-function sessionDailySpend(session) {
-  const days = 14
+function formatSize(bytes) {
+  const n = Number(bytes)
+  if (!Number.isFinite(n) || n <= 0) return "—"
+  if (n < 1024) return `${n} Б`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1).replace(".", ",")} КБ`
+  return `${(n / 1024 / 1024).toFixed(1).replace(".", ",")} МБ`
+}
 
+function sessionDailySpend(session) {
   try {
     const data = session?.server?.data
     if (!data) return []
@@ -271,16 +283,11 @@ function sessionDailySpend(session) {
       byDay.set(key, (byDay.get(key) || 0) + cost)
     }
 
-    const out = []
-    const today = new Date()
-
-    for (let i = days - 1; i >= 0; i--) {
-      const date = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i)
-      const key = localDateKey(date)
-      out.push({ date: key, usd: byDay.get(key) || 0 })
-    }
-
-    return out
+    return [...byDay.entries()]
+      .filter(([, usd]) => usd > 0)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .slice(-10)
+      .map(([date, usd]) => ({ date, usd }))
   } catch {
     return []
   }
@@ -723,7 +730,7 @@ function buildRows(state, usd, daily, todayUsd, display) {
 
   if (daily && daily.length > 0) {
     const total = daily.reduce((sum, point) => sum + point.usd, 0)
-    const chart = sparkline(daily.map((point) => point.usd * rate), true)
+    const chart = sparkline(daily.map((point) => point.usd * rate), false)
 
     if (total > 0 && chart) {
       const spendDays = daily.filter((point) => point.usd > 0).slice(-3)
@@ -737,7 +744,7 @@ function buildRows(state, usd, daily, todayUsd, display) {
         detail: summary ? `расход по дням · ${summary}` : `расход по дням · ${daily.length} дн.`,
       })
 
-      const historyPoints = daily.filter((point) => point.usd > 0).slice(-7)
+      const historyPoints = daily.filter((point) => point.usd > 0).slice(-10)
       if (historyPoints.length > 0) {
         rows.push({
           id: "session-history",
@@ -920,6 +927,19 @@ const definition = Plugin.define({
     const client = ctx.main(Status)
     const [now, setNow] = createSignal(Date.now())
     const [displayCurrency, setDisplayCurrency] = createSignal("CNY")
+    const [windowUpdate, setWindowUpdate] = createSignal({
+      state: "idle",
+      latest: "",
+      available: false,
+      notes: "",
+      url: "",
+      sha256: "",
+      size: 0,
+      checkedAt: "",
+      error: "",
+    })
+    const [autoUpdateWindow, setAutoUpdateWindow] = createSignal(true)
+    const [updateDismissed, setUpdateDismissed] = createSignal(false)
     const tick = setInterval(() => setNow(Date.now()), 15000)
 
     let updateOverlay = null
@@ -945,7 +965,7 @@ const definition = Plugin.define({
         "color: #e5e7eb",
         "box-shadow: 0 18px 50px rgba(0,0,0,.45)",
         "font: 13px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif",
-        "pointer-events: none",
+        "pointer-events: auto",
         "display: none",
       ].join(";")
 
@@ -958,7 +978,10 @@ const definition = Plugin.define({
 
       const notes = document.createElement("div")
       notes.style.cssText =
-        "color: #94a3b8; white-space: pre-line; max-height: 84px; overflow: hidden; margin-bottom: 10px;"
+        "color: #94a3b8; white-space: pre-line; max-height: 120px; overflow: auto; margin-bottom: 8px;"
+
+      const size = document.createElement("div")
+      size.style.cssText = "color: #94a3b8; font-size: 12px; margin-bottom: 8px;"
 
       const barOuter = document.createElement("div")
       barOuter.style.cssText =
@@ -972,60 +995,229 @@ const definition = Plugin.define({
       const message = document.createElement("div")
       message.style.cssText = "margin-top: 8px; color: #cbd5e1; font-size: 12px;"
 
+      const actions = document.createElement("div")
+      actions.style.cssText =
+        "display: none; gap: 8px; margin-top: 12px; justify-content: flex-end;"
+
+      const later = document.createElement("button")
+      later.type = "button"
+      later.textContent = "Позже"
+      later.style.cssText =
+        "border: 1px solid #475569; border-radius: 8px; padding: 6px 12px; background: transparent; color: #e5e7eb; font: inherit; cursor: pointer;"
+      later.addEventListener("click", () => {
+        setUpdateDismissed(true)
+        overlay.style.display = "none"
+      })
+
+      const install = document.createElement("button")
+      install.type = "button"
+      install.textContent = "Установить"
+      install.style.cssText =
+        "border: 0; border-radius: 8px; padding: 6px 12px; background: #3b82f6; color: #fff; font: inherit; font-weight: 600; cursor: pointer;"
+      install.addEventListener("click", () => {
+        setUpdateDismissed(true)
+        overlay.style.display = "none"
+        downloadOrInstallUpdate(windowUpdate())
+      })
+
+      actions.appendChild(later)
+      actions.appendChild(install)
+
       overlay.appendChild(title)
       overlay.appendChild(versions)
       overlay.appendChild(notes)
+      overlay.appendChild(size)
       overlay.appendChild(barOuter)
       overlay.appendChild(message)
+      overlay.appendChild(actions)
       document.body.appendChild(overlay)
 
       updateOverlay = overlay
-      overlay._refs = { versions, notes, barInner, message }
+      overlay._refs = {
+        title,
+        versions,
+        notes,
+        size,
+        barOuter,
+        barInner,
+        message,
+        actions,
+        install,
+        later,
+      }
       return overlay
     }
 
     const renderUpdateOverlay = () => {
       if (typeof document === "undefined") return
       const state = client.state()
+      const update = windowUpdate()
       const overlay = ensureUpdateOverlay()
       if (!overlay) return
 
-      if (!state || !state.updating) {
-        if (state && state.updateProgress >= 100 && state.updateMessage) {
-          if (!updateOverlayDone) updateOverlayDone = Date.now()
-          if (Date.now() - updateOverlayDone < 8000) {
-            overlay.style.display = "block"
-            overlay._refs.versions.textContent = `${state.updateFrom || state.version} → ${state.updateTo || state.latestVersion}`
-            overlay._refs.notes.textContent = state.updateNotes || ""
-            overlay._refs.barInner.style.width = "100%"
-            overlay._refs.message.textContent = state.updateMessage
-            return
-          }
-        }
-
+      const refs = overlay._refs
+      const show = () => {
+        overlay.style.display = "block"
+      }
+      const hide = () => {
         overlay.style.display = "none"
-        updateOverlayDone = 0
+      }
+      const setBar = (width) => {
+        if (width === null) {
+          refs.barOuter.style.display = "none"
+          refs.barInner.style.width = "0%"
+        } else {
+          refs.barOuter.style.display = "block"
+          refs.barInner.style.width = `${Math.max(0, Math.min(100, width))}%`
+        }
+      }
+      const setActions = (visible) => {
+        refs.actions.style.display = visible ? "flex" : "none"
+      }
+
+      if (state && state.updating) {
+        show()
+        setActions(false)
+        setBar(Number(state.updateProgress) || 0)
+        refs.title.textContent = "Обновление плагина"
+        refs.versions.textContent = `${state.updateFrom || state.version} → ${state.updateTo || state.latestVersion}`
+        refs.notes.textContent = state.updateNotes || ""
+        refs.size.textContent = ""
+        refs.message.textContent = `${state.updateMessage || "идёт обновление"}${state.updateProgress ? ` · ${Math.round(state.updateProgress)}%` : ""}`
         return
       }
 
-      updateOverlayDone = 0
-      overlay.style.display = "block"
-      overlay._refs.versions.textContent = `${state.updateFrom || state.version} → ${state.updateTo || state.latestVersion}`
-      overlay._refs.notes.textContent = state.updateNotes || ""
-      overlay._refs.barInner.style.width = `${Math.max(0, Math.min(100, Number(state.updateProgress) || 0))}%`
-      overlay._refs.message.textContent = `${state.updateMessage || ""}${state.updateProgress ? ` · ${Math.round(state.updateProgress)}%` : ""}`
+      if (update.state === "checking") {
+        show()
+        setActions(false)
+        setBar(30)
+        refs.title.textContent = "Проверка обновлений"
+        refs.versions.textContent = `Версия ${PLUGIN_VERSION}`
+        refs.notes.textContent = ""
+        refs.size.textContent = ""
+        refs.message.textContent = "Проверяем обновления..."
+        return
+      }
+
+      if (update.available && !updateDismissed()) {
+        show()
+        setActions(true)
+        setBar(null)
+        refs.title.textContent = "Доступно обновление"
+        refs.versions.textContent = `${PLUGIN_VERSION} → ${update.latest}`
+        refs.notes.textContent = update.notes || ""
+        refs.size.textContent = `Вес обновления: ${formatSize(update.size)}`
+        refs.message.textContent = "Установить обновление сейчас?"
+        return
+      }
+
+      if (update.checkedAt && !update.available && !updateDismissed()) {
+        const age = Date.now() - new Date(update.checkedAt).getTime()
+        if (age < 6000) {
+          show()
+          setActions(false)
+          setBar(null)
+          refs.title.textContent = "Обновления"
+          refs.versions.textContent = `Версия ${PLUGIN_VERSION}`
+          refs.notes.textContent = ""
+          refs.size.textContent = ""
+          refs.message.textContent = "У вас последняя версия"
+          return
+        }
+      }
+
+      hide()
     }
 
     updateOverlayTimer = setInterval(renderUpdateOverlay, 500)
     renderUpdateOverlay()
+
+    const checkForUpdatesWindow = async () => {
+      setUpdateDismissed(false)
+      setWindowUpdate((prev) => ({ ...prev, state: "checking", error: "" }))
+
+      try {
+        const response = await fetch(`${UPDATE_MANIFEST_URL}?t=${Date.now()}`, {
+          cache: "no-store",
+        })
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+
+        const data = await response.json()
+        const latest = String(data.version || "").trim()
+        if (!latest) throw new Error("в манифесте нет версии")
+
+        let size = Number(data.size) || 0
+        if (!size && data.zip) {
+          try {
+            const zipResponse = await fetch(String(data.zip), { cache: "no-store" })
+            const zipBuffer = await zipResponse.arrayBuffer()
+            size = zipBuffer.byteLength
+          } catch {}
+        }
+
+        setWindowUpdate({
+          state: "done",
+          latest,
+          available: compareVersions(latest, PLUGIN_VERSION) > 0,
+          notes: String(data.notes || ""),
+          url: String(data.zip || ""),
+          sha256: String(data.sha256 || ""),
+          size,
+          checkedAt: new Date().toISOString(),
+          error: "",
+        })
+      } catch (error) {
+        setWindowUpdate((prev) => ({
+          ...prev,
+          state: "error",
+          checkedAt: new Date().toISOString(),
+          error: String(error && error.message ? error.message : error),
+        }))
+      }
+    }
+
+    const downloadOrInstallUpdate = (update) => {
+      if (!update || !update.url) return
+
+      try {
+        if (typeof client.installUpdate === "function") {
+          void client
+            .installUpdate({
+              url: update.url,
+              sha256: update.sha256,
+              version: update.latest,
+            })
+            .catch(() => openExternalUrl(ctx, update.url))
+          return
+        }
+      } catch {}
+
+      openExternalUrl(ctx, update.url)
+    }
+
+    const toggleAutoUpdateWindow = () => {
+      const next = !autoUpdateWindow()
+      setAutoUpdateWindow(next)
+
+      try {
+        if (typeof client.toggleAutoUpdate === "function") {
+          void client.toggleAutoUpdate().catch(() => {})
+        }
+      } catch {}
+    }
+
+    const windowUpdateTimer = setInterval(() => void checkForUpdatesWindow(), UPDATE_CHECK_INTERVAL)
+    setTimeout(() => void checkForUpdatesWindow(), 2000)
 
     const decorateCurrencyButton = () => {
       if (typeof document === "undefined") return
 
       const pills = document.querySelectorAll('button[data-slot="session-plugin-pill"]')
       for (const pill of pills) {
-        const text = (pill.textContent || "").trim()
-        if (!text.startsWith("DS ")) continue
+        const label = Array.from(pill.querySelectorAll("span")).find((element) =>
+          (element.textContent || "").trim().startsWith("DS "),
+        )
+        if (!label) continue
 
         let button = pill.querySelector('[data-currency-toggle="1"]')
         if (!button) {
@@ -1040,7 +1232,7 @@ const definition = Plugin.define({
             "justify-content:center",
             "width:20px",
             "height:20px",
-            "margin-left:6px",
+            "margin-right:6px",
             "border-radius:999px",
             "border:1px solid #64748b",
             "font-size:11px",
@@ -1071,8 +1263,11 @@ const definition = Plugin.define({
               cycle()
             }
           })
+        }
 
-          pill.appendChild(button)
+        const parent = label.parentNode
+        if (parent && (button.parentNode !== parent || button.nextSibling !== label)) {
+          parent.insertBefore(button, label)
         }
 
         button.textContent = currencySymbol(displayCurrency())
@@ -1097,8 +1292,27 @@ const definition = Plugin.define({
       if (!row) return
       if (!(row.textContent || "").includes("расход по дням")) return
 
-      const text = chartFullText()
-      if (!text) return
+      const dataset = chartCache.get("session")
+      if (!dataset || !dataset.points || dataset.points.length === 0) return
+
+      const label = Array.from(row.querySelectorAll("span")).find(
+        (element) =>
+          !(element.textContent || "").includes("расход по дням") &&
+          (element.textContent || "").trim().length > 0,
+      )
+      const rect = (label || row).getBoundingClientRect()
+      const count = dataset.points.length
+      const ratio = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0
+      const index = Math.max(0, Math.min(count - 1, Math.floor(ratio * count)))
+      const point = dataset.points[index]
+
+      if (!point) {
+        const text = chartFullText()
+        if (text) showChartTooltip(text, event.clientX, event.clientY)
+        return
+      }
+
+      const text = `${formatShortDate(point.date)}: ${formatPrice(point.rate, dataset.digits)} ${dataset.unit}`
       showChartTooltip(text, event.clientX, event.clientY)
     }
 
@@ -1383,10 +1597,10 @@ const definition = Plugin.define({
               2,
               false,
               chartUnit,
-              true,
+              false,
             )
           } else {
-            setChartPoints("session", "[]", 2, false, chartUnit, true)
+            setChartPoints("session", "[]", 2, false, chartUnit, false)
           }
 
           const rows = buildRows(
@@ -1397,20 +1611,22 @@ const definition = Plugin.define({
             { currency, setCurrency: setDisplayCurrency },
           )
 
+          const update = windowUpdate()
+
           rows.unshift({
             id: "version",
-            label: `Версия плагина: ${state.version || PLUGIN_VERSION}`,
+            label: `Версия плагина: ${PLUGIN_VERSION}`,
             detail: state.updating
               ? "идёт обновление"
-              : state.updateChecking
+              : update.state === "checking"
                 ? "проверяем обновление…"
-                : state.updateError
+                : update.error
                   ? "проверка не удалась"
-                  : state.updateAvailable
-                    ? `доступна ${state.latestVersion}`
-                    : state.updateCheckedAt
+                  : update.available
+                    ? `доступна ${update.latest}`
+                    : update.checkedAt
                       ? "последняя версия"
-                      : "проверка ещё не выполнялась",
+                      : "нажмите «Проверить обновление»",
           })
 
           if (state.updating) {
@@ -1419,33 +1635,33 @@ const definition = Plugin.define({
               label: `Обновление ${state.updateFrom} → ${state.updateTo}`,
               detail: `${state.updateMessage || "идёт обновление"} · ${Math.round(state.updateProgress)}%`,
             })
-          } else if (state.updateAvailable) {
+          } else if (update.available) {
             rows.push({
               id: "update-available",
-              label: `Обновить до ${state.latestVersion}`,
-              detail: state.updateNotes
-                ? state.updateNotes.split("\n")[0].slice(0, 120)
-                : "скачать и установить автоматически",
-              run: () => void client.installUpdate().catch(() => {}),
+              label: `Обновить до ${update.latest}`,
+              detail: update.notes
+                ? update.notes.split("\n")[0].slice(0, 120)
+                : "скачать и установить",
+              run: () => downloadOrInstallUpdate(update),
             })
           }
 
           rows.push({
             id: "auto-update",
-            label: `Автообновление: ${state.autoUpdate ? "вкл" : "выкл"}`,
-            detail: state.autoUpdate ? "новые версии ставятся сами" : "только по кнопке",
-            run: () => void client.toggleAutoUpdate().catch(() => {}),
+            label: `Автообновление: ${autoUpdateWindow() ? "вкл" : "выкл"}`,
+            detail: autoUpdateWindow() ? "новые версии ставятся сами" : "только по кнопке",
+            run: () => toggleAutoUpdateWindow(),
           })
 
           rows.push({
             id: "check-update",
-            label: state.updateChecking ? "Проверяем обновление…" : "Проверить обновление",
-            detail: state.updateError
-              ? `ошибка: ${state.updateError}`
-              : state.updateCheckedAt && !state.updateAvailable
+            label: update.state === "checking" ? "Проверяем обновление…" : "Проверить обновление",
+            detail: update.error
+              ? `ошибка: ${update.error}`
+              : update.checkedAt && !update.available
                 ? "у вас последняя версия"
                 : "",
-            run: () => void client.checkUpdate().catch(() => {}),
+            run: () => void checkForUpdatesWindow(),
           })
 
           return {
@@ -1733,6 +1949,7 @@ const definition = Plugin.define({
       if (updateOverlay && updateOverlay.parentNode) updateOverlay.parentNode.removeChild(updateOverlay)
       updateOverlay = null
       if (currencyTimer) clearInterval(currencyTimer)
+      if (windowUpdateTimer) clearInterval(windowUpdateTimer)
       if (typeof document !== "undefined") {
         document.removeEventListener("mousemove", onChartRowMove)
         document.removeEventListener("mouseout", onChartRowOut)
@@ -2298,7 +2515,18 @@ const definition = Plugin.define({
       checkUpdate() {
         return checkUpdate()
       },
-      installUpdate() {
+      installUpdate(input) {
+        if (input) {
+          snapshot = {
+            ...snapshot,
+            updateUrl: input.url || snapshot.updateUrl,
+            updateSha: input.sha256 || snapshot.updateSha,
+            latestVersion: input.version || snapshot.latestVersion,
+            updateTo: input.version || snapshot.updateTo,
+            updateFrom: PLUGIN_VERSION,
+          }
+        }
+
         return installUpdate()
       },
       toggleAutoUpdate() {
