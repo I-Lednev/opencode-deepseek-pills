@@ -1,7 +1,7 @@
 "use strict"
 
 const { ComposerPill, Command, Ipc, Plugin, Style } = require("@opencode/plugin/gui")
-const { createSignal } = require("solid-js")
+const { createEffect, createSignal } = require("solid-js")
 const { Schema } = require("effect")
 
 // Фиксированный курс пересчёта USD -> CNY.
@@ -9,7 +9,7 @@ const { Schema } = require("effect")
 const CNY_PER_USD = 6.6854
 
 // Версия плагина и адрес манифеста обновлений на GitHub Pages.
-const PLUGIN_VERSION = "1.3.3"
+const PLUGIN_VERSION = "1.3.4"
 const UPDATE_MANIFEST_URL = "https://i-lednev.github.io/opencode-deepseek-pills/version.json"
 const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1000
 
@@ -453,7 +453,8 @@ function chartPointTitle(point, digits, showTime, unit) {
     showTime && point.ts
       ? new Date(point.ts).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })
       : ""
-  return `${formatShortDate(point.date)}${time ? ` ${time}` : ""}: ${formatPrice(point.rate, digits)} ${unit || "₽"}`
+  const label = point.total ? "Итого" : formatShortDate(point.date)
+  return `${label}${time ? ` ${time}` : ""}: ${formatPrice(point.rate, digits)} ${unit || "₽"}`
 }
 
 function parseAmount(value) {
@@ -729,32 +730,39 @@ function buildRows(state, usd, daily, todayUsd, display) {
   }
 
   if (daily && daily.length > 0) {
-    const total = daily.reduce((sum, point) => sum + point.usd, 0)
+    const dailyOnly = daily.filter((point) => !point.total && point.usd > 0)
+    const totalPoint = daily.find((point) => point.total)
     const chart = sparkline(daily.map((point) => point.usd * rate), false)
 
-    if (total > 0 && chart) {
-      const spendDays = daily.filter((point) => point.usd > 0).slice(-3)
+    if (chart) {
+      const spendDays = dailyOnly.slice(-3)
       const summary = spendDays
         .map((point) => `${formatShortDate(point.date)}: ${formatMoney(point.usd * rate, currency)}`)
         .join(" · ")
+      const totalText = totalPoint
+        ? `Итого: ${formatMoney(totalPoint.usd * rate, currency)}`
+        : ""
+      const detail = [summary, totalText].filter(Boolean).join(" · ")
 
       rows.push({
         id: "session-chart",
         label: chart,
-        detail: summary ? `расход по дням · ${summary}` : `расход по дням · ${daily.length} дн.`,
+        detail: detail ? `расход по дням · ${detail}` : "расход по дням",
       })
 
-      const historyPoints = daily.filter((point) => point.usd > 0).slice(-10)
-      if (historyPoints.length > 0) {
+      const historyPoints = dailyOnly.slice(-10)
+      if (historyPoints.length > 0 || totalPoint) {
+        const historyText = historyPoints
+          .map(
+            (point) =>
+              `${formatShortDate(point.date)}: ${formatMoney(point.usd * rate, currency)}`,
+          )
+          .join(" · ")
+
         rows.push({
           id: "session-history",
           label: "История по дням",
-          detail: historyPoints
-            .map(
-              (point) =>
-                `${formatShortDate(point.date)}: ${formatMoney(point.usd * rate, currency)}`,
-            )
-            .join(" · "),
+          detail: [historyText, totalText].filter(Boolean).join(" · "),
         })
       }
     }
@@ -940,6 +948,7 @@ const definition = Plugin.define({
     })
     const [autoUpdateWindow, setAutoUpdateWindow] = createSignal(true)
     const [updateDismissed, setUpdateDismissed] = createSignal(false)
+    const [sessionHistory, setSessionHistory] = createSignal({ id: "", points: [] })
     const tick = setInterval(() => setNow(Date.now()), 15000)
 
     let updateOverlay = null
@@ -1206,6 +1215,63 @@ const definition = Plugin.define({
       } catch {}
     }
 
+    const loadSessionHistory = async (session) => {
+      if (!session) return
+
+      try {
+        const byDay = new Map()
+        let cursor = ""
+        let guard = 0
+
+        do {
+          const query = { sessionID: session.id, limit: "500", type: "assistant" }
+          if (cursor) query.cursor = cursor
+          else query.order = "asc"
+
+          const response = await client.session.message.list(query)
+          const data = Array.isArray(response?.data)
+            ? response.data
+            : Array.isArray(response)
+              ? response
+              : []
+
+          for (const message of data) {
+            const info = message && message.info ? message.info : message
+            if (!info || info.type !== "assistant") continue
+
+            const cost = Number(info.cost)
+            const created = info.time && info.time.created
+            if (!Number.isFinite(cost) || cost <= 0 || !created) continue
+
+            const key = localDateKey(new Date(created))
+            byDay.set(key, (byDay.get(key) || 0) + cost)
+          }
+
+          cursor = response?.cursor?.next ?? ""
+          guard++
+        } while (cursor && guard < 20)
+
+        setSessionHistory({
+          id: session.id,
+          points: [...byDay.entries()]
+            .map(([date, usd]) => ({ date, usd }))
+            .sort((left, right) => left.date.localeCompare(right.date)),
+        })
+      } catch {
+        setSessionHistory({ id: session.id, points: [] })
+      }
+    }
+
+    createEffect(() => {
+      const session = ctx.sessions.current()
+      if (session) void loadSessionHistory(session)
+    })
+
+    const historyTimer = setInterval(() => {
+      const session = ctx.sessions.current()
+      if (session) void loadSessionHistory(session)
+    }, 60000)
+
     const windowUpdateTimer = setInterval(() => void checkForUpdatesWindow(), UPDATE_CHECK_INTERVAL)
     setTimeout(() => void checkForUpdatesWindow(), 2000)
 
@@ -1312,7 +1378,8 @@ const definition = Plugin.define({
         return
       }
 
-      const text = `${formatShortDate(point.date)}: ${formatPrice(point.rate, dataset.digits)} ${dataset.unit}`
+      const pointLabel = point.total ? "Итого" : formatShortDate(point.date)
+      const text = `${pointLabel}: ${formatPrice(point.rate, dataset.digits)} ${dataset.unit}`
       showChartTooltip(text, event.clientX, event.clientY)
     }
 
@@ -1352,10 +1419,7 @@ const definition = Plugin.define({
         .join(",")}`
 
       const fullText = points
-        .map(
-          (point) =>
-            `${formatShortDate(point.date)}: ${formatPrice(point.rate, dataset.digits)} ${dataset.unit}`,
-        )
+        .map((point) => chartPointTitle(point, dataset.digits, dataset.showTime, dataset.unit))
         .join(" · ")
 
       row.setAttribute("title", fullText)
@@ -1546,8 +1610,41 @@ const definition = Plugin.define({
           }
 
           const usd = sessionCost(input.session)
-          const daily = sessionDailySpend(input.session)
-          const todayUsd = sessionSpendToday(daily)
+          const storeDaily = sessionDailySpend(input.session)
+          const history = sessionHistory()
+          const merged = new Map()
+
+          if (history.id === input.session.id) {
+            for (const point of history.points) {
+              merged.set(point.date, Math.max(merged.get(point.date) || 0, point.usd))
+            }
+          }
+          for (const point of storeDaily) {
+            merged.set(point.date, Math.max(merged.get(point.date) || 0, point.usd))
+          }
+
+          const dailyPoints = [...merged.entries()]
+            .filter(([, value]) => value > 0)
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([date, value]) => ({ date, usd: value }))
+
+          const todayUsd = sessionSpendToday(dailyPoints)
+          const totalUsd =
+            typeof usd === "number"
+              ? usd
+              : dailyPoints.reduce((sum, point) => sum + point.usd, 0)
+
+          const chartPoints = dailyPoints
+            .slice(-9)
+            .map((point) => ({ date: point.date, usd: point.usd, total: false }))
+          if (totalUsd > 0) {
+            chartPoints.push({
+              date: localDateKey(new Date()),
+              usd: totalUsd,
+              total: true,
+            })
+          }
+
           const canRub = state.cbr > 0 && state.rate > 0
           const requested = displayCurrency()
           const currency =
@@ -1584,14 +1681,15 @@ const definition = Plugin.define({
           const label = [balanceLabel, spendShort, todayShort].filter(Boolean).join(" · ")
           const chartUnit = currencySymbol(currency)
 
-          if (state.rate > 0 && daily.length > 0) {
+          if (state.rate > 0 && chartPoints.length > 0) {
             setChartPoints(
               "session",
               JSON.stringify(
-                daily.map((point) => ({
+                chartPoints.map((point) => ({
                   date: point.date,
                   rate: point.usd * rate,
                   ts: 0,
+                  total: !!point.total,
                 })),
               ),
               2,
@@ -1606,7 +1704,7 @@ const definition = Plugin.define({
           const rows = buildRows(
             { ...state, refresh: () => client.refresh() },
             usd,
-            daily,
+            chartPoints,
             todayUsd,
             { currency, setCurrency: setDisplayCurrency },
           )
@@ -1950,6 +2048,7 @@ const definition = Plugin.define({
       updateOverlay = null
       if (currencyTimer) clearInterval(currencyTimer)
       if (windowUpdateTimer) clearInterval(windowUpdateTimer)
+      if (historyTimer) clearInterval(historyTimer)
       if (typeof document !== "undefined") {
         document.removeEventListener("mousemove", onChartRowMove)
         document.removeEventListener("mouseout", onChartRowOut)
