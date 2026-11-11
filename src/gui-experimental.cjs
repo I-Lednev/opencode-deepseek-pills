@@ -9,8 +9,9 @@ const { Schema } = require("effect")
 const CNY_PER_USD = 6.6854
 
 // Версия плагина и адрес манифеста обновлений на GitHub Pages.
-const PLUGIN_VERSION = "1.3.4"
-const UPDATE_MANIFEST_URL = "https://i-lednev.github.io/opencode-deepseek-pills/version.json"
+const PLUGIN_VERSION = "1.3.5"
+const UPDATE_MANIFEST_URL =
+  "https://raw.githubusercontent.com/I-Lednev/opencode-deepseek-pills/main/docs/version.json"
 const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1000
 
 // Немного растягиваем пилюли: если строка не помещается в окно, они переносятся
@@ -748,6 +749,7 @@ function buildRows(state, usd, daily, todayUsd, display) {
         id: "session-chart",
         label: chart,
         detail: detail ? `расход по дням · ${detail}` : "расход по дням",
+        run: () => {},
       })
 
       const historyPoints = dailyOnly.slice(-10)
@@ -763,6 +765,7 @@ function buildRows(state, usd, daily, todayUsd, display) {
           id: "session-history",
           label: "История по дням",
           detail: [historyText, totalText].filter(Boolean).join(" · "),
+          run: () => {},
         })
       }
     }
