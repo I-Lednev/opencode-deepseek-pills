@@ -72,6 +72,7 @@ $manifest = [ordered]@{
     version = $version
     zip = "https://i-lednev.github.io/opencode-deepseek-pills/opencode-transfer.zip"
     sha256 = $hash
+    size = (Get-Item $zip).Length
     notes = $Notes
     publishedAt = (Get-Date).ToString("yyyy-MM-dd")
 } | ConvertTo-Json -Depth 6
