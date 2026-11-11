@@ -9,7 +9,7 @@ const { Schema } = require("effect")
 const CNY_PER_USD = 6.6854
 
 // Версия плагина и адрес манифеста обновлений на GitHub Pages.
-const PLUGIN_VERSION = "1.3.0"
+const PLUGIN_VERSION = "1.3.1"
 const UPDATE_MANIFEST_URL = "https://i-lednev.github.io/opencode-deepseek-pills/version.json"
 const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1000
 
@@ -736,6 +736,20 @@ function buildRows(state, usd, daily, todayUsd, display) {
         label: chart,
         detail: summary ? `расход по дням · ${summary}` : `расход по дням · ${daily.length} дн.`,
       })
+
+      const historyPoints = daily.filter((point) => point.usd > 0).slice(-7)
+      if (historyPoints.length > 0) {
+        rows.push({
+          id: "session-history",
+          label: "История по дням",
+          detail: historyPoints
+            .map(
+              (point) =>
+                `${formatShortDate(point.date)}: ${formatMoney(point.usd * rate, currency)}`,
+            )
+            .join(" · "),
+        })
+      }
     }
   }
 
@@ -1005,6 +1019,106 @@ const definition = Plugin.define({
     updateOverlayTimer = setInterval(renderUpdateOverlay, 500)
     renderUpdateOverlay()
 
+    const decorateCurrencyButton = () => {
+      if (typeof document === "undefined") return
+
+      const pills = document.querySelectorAll('button[data-slot="session-plugin-pill"]')
+      for (const pill of pills) {
+        const text = (pill.textContent || "").trim()
+        if (!text.startsWith("DS ")) continue
+
+        let button = pill.querySelector('[data-currency-toggle="1"]')
+        if (!button) {
+          button = document.createElement("span")
+          button.dataset.currencyToggle = "1"
+          button.setAttribute("role", "button")
+          button.setAttribute("tabindex", "0")
+          button.title = "Переключить валюту"
+          button.style.cssText = [
+            "display:inline-flex",
+            "align-items:center",
+            "justify-content:center",
+            "width:20px",
+            "height:20px",
+            "margin-left:6px",
+            "border-radius:999px",
+            "border:1px solid #64748b",
+            "font-size:11px",
+            "line-height:1",
+            "font-weight:600",
+            "cursor:pointer",
+            "user-select:none",
+            "flex:0 0 auto",
+          ].join(";")
+
+          const cycle = () => {
+            const order = ["RUB", "CNY", "USD"]
+            const current = displayCurrency()
+            const next = order[(order.indexOf(current) + 1) % order.length]
+            setDisplayCurrency(next)
+            button.textContent = currencySymbol(next)
+          }
+
+          button.addEventListener("click", (event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            cycle()
+          })
+          button.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault()
+              event.stopPropagation()
+              cycle()
+            }
+          })
+
+          pill.appendChild(button)
+        }
+
+        button.textContent = currencySymbol(displayCurrency())
+      }
+    }
+
+    const chartFullText = () => {
+      const dataset = chartCache.get("session")
+      if (!dataset || !dataset.points || dataset.points.length === 0) return ""
+
+      return dataset.points
+        .map(
+          (point) =>
+            `${formatShortDate(point.date)}: ${formatPrice(point.rate, dataset.digits)} ${dataset.unit}`,
+        )
+        .join(" · ")
+    }
+
+    const onChartRowMove = (event) => {
+      if (!(event.target instanceof Element)) return
+      const row = event.target.closest('[data-slot="session-plugin-pill-row"]')
+      if (!row) return
+      if (!(row.textContent || "").includes("расход по дням")) return
+
+      const text = chartFullText()
+      if (!text) return
+      showChartTooltip(text, event.clientX, event.clientY)
+    }
+
+    const onChartRowOut = (event) => {
+      if (!(event.target instanceof Element)) return
+      const row = event.target.closest('[data-slot="session-plugin-pill-row"]')
+      if (!row) return
+      if (!(row.textContent || "").includes("расход по дням")) return
+      if (event.relatedTarget instanceof Node && row.contains(event.relatedTarget)) return
+      hideChartTooltip()
+    }
+
+    if (typeof document !== "undefined") {
+      document.addEventListener("mousemove", onChartRowMove)
+      document.addEventListener("mouseout", onChartRowOut)
+    }
+
+    const currencyTimer = setInterval(decorateCurrencyButton, 750)
+    decorateCurrencyButton()
+
     try {
       ctx.add(Style, PILL_STYLE)
     } catch (error) {
@@ -1029,6 +1143,8 @@ const definition = Plugin.define({
             `${formatShortDate(point.date)}: ${formatPrice(point.rate, dataset.digits)} ${dataset.unit}`,
         )
         .join(" · ")
+
+      row.setAttribute("title", fullText)
 
       if (!row.dataset.chartHover) {
         row.addEventListener("mouseenter", (event) =>
@@ -1293,7 +1409,7 @@ const definition = Plugin.define({
                   : state.updateAvailable
                     ? `доступна ${state.latestVersion}`
                     : state.updateCheckedAt
-                      ? "обновлений нет"
+                      ? "последняя версия"
                       : "проверка ещё не выполнялась",
           })
 
@@ -1324,7 +1440,11 @@ const definition = Plugin.define({
           rows.push({
             id: "check-update",
             label: state.updateChecking ? "Проверяем обновление…" : "Проверить обновление",
-            detail: state.updateError ? `ошибка: ${state.updateError}` : "",
+            detail: state.updateError
+              ? `ошибка: ${state.updateError}`
+              : state.updateCheckedAt && !state.updateAvailable
+                ? "у вас последняя версия"
+                : "",
             run: () => void client.checkUpdate().catch(() => {}),
           })
 
@@ -1612,6 +1732,11 @@ const definition = Plugin.define({
       if (updateOverlayTimer) clearInterval(updateOverlayTimer)
       if (updateOverlay && updateOverlay.parentNode) updateOverlay.parentNode.removeChild(updateOverlay)
       updateOverlay = null
+      if (currencyTimer) clearInterval(currencyTimer)
+      if (typeof document !== "undefined") {
+        document.removeEventListener("mousemove", onChartRowMove)
+        document.removeEventListener("mouseout", onChartRowOut)
+      }
     }
   },
 
