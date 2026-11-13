@@ -9,7 +9,7 @@ const { Schema } = require("effect")
 const CNY_PER_USD = 6.6854
 
 // Версия плагина и адрес манифеста обновлений на GitHub Pages.
-const PLUGIN_VERSION = "1.3.6"
+const PLUGIN_VERSION = "1.3.7"
 const UPDATE_MANIFEST_URL =
   "https://raw.githubusercontent.com/I-Lednev/opencode-deepseek-pills/main/docs/version.json"
 const UPDATE_CHECK_INTERVAL = 6 * 60 * 60 * 1000
@@ -298,40 +298,6 @@ function sessionSpendToday(daily) {
   const today = localDateKey(new Date())
   const point = (daily || []).find((item) => item.date === today)
   return point ? point.usd : 0
-}
-
-function previousTaskSpend(session) {
-  try {
-    const data = session?.server?.data
-    if (!data) return 0
-
-    const messages = data.session.message.list(session.id) ?? []
-    const list = messages
-      .map((message) => (message && message.info ? message.info : message))
-      .filter(Boolean)
-    const users = list
-      .filter((message) => message.type === "user" && message.time && message.time.created)
-      .sort((left, right) => left.time.created - right.time.created)
-
-    if (users.length < 2) return 0
-
-    const from = users[users.length - 2].time.created
-    const to = users[users.length - 1].time.created
-    let cost = 0
-
-    for (const message of list) {
-      if (message.type !== "assistant") continue
-
-      const created = message.time && message.time.created
-      const value = Number(message.cost)
-      if (!created || !Number.isFinite(value) || value <= 0) continue
-      if (created >= from && created < to) cost += value
-    }
-
-    return cost
-  } catch {
-    return 0
-  }
 }
 
 const SPARK_CHARS = "▁▂▃▄▅▆▇█"
@@ -687,7 +653,7 @@ function adviceLabel(state) {
   return "Курс стабилен — можно не спешить"
 }
 
-function buildRows(state, usd, daily, todayUsd, previousUsd, display) {
+function buildRows(state, usd, daily, todayUsd, display) {
   const rows = []
   const order = ["RUB", "CNY", "USD"]
   const requested = display && order.includes(display.currency) ? display.currency : "CNY"
@@ -762,14 +728,6 @@ function buildRows(state, usd, daily, todayUsd, previousUsd, display) {
       label: `Сегодня ≈ −${formatMoney(todayValue, currency)}`,
       detail: `за ${formatShortDate(localDateKey(new Date()))} · по сообщениям сессии`,
     })
-
-    if (previousUsd > 0) {
-      rows.push({
-        id: "previous-task",
-        label: `Прошлая задача ≈ −${formatMoney(previousUsd * rate, currency)}`,
-        detail: "по сообщениям сессии · не сохраняется",
-      })
-    }
   }
 
   if (daily && daily.length > 0) {
@@ -1684,7 +1642,6 @@ const definition = Plugin.define({
             .map(([date, value]) => ({ date, usd: value }))
 
           const todayUsd = sessionSpendToday(dailyPoints)
-          const previousUsd = previousTaskSpend(input.session)
           const totalUsd =
             typeof usd === "number"
               ? usd
@@ -1734,17 +1691,7 @@ const definition = Plugin.define({
             state.rate > 0 && usd !== null ? `−${formatMoneyShort(usd * rate, currency)}` : null
           const todayShort =
             state.rate > 0 && usd !== null ? `−${formatMoneyShort(todayUsd * rate, currency)}` : null
-          const previous =
-            state.rate > 0 && previousUsd > 0
-              ? `−${formatMoney(previousUsd * rate, currency)}`
-              : null
-          const previousShort =
-            state.rate > 0 && previousUsd > 0
-              ? `−${formatMoneyShort(previousUsd * rate, currency)}`
-              : null
-          const label = [balanceLabel, spendShort, todayShort, previousShort]
-            .filter(Boolean)
-            .join(" · ")
+          const label = [balanceLabel, spendShort, todayShort].filter(Boolean).join(" · ")
           const chartUnit = currencySymbol(currency)
 
           if (state.rate > 0 && chartPoints.length > 0) {
@@ -1772,7 +1719,6 @@ const definition = Plugin.define({
             usd,
             chartPoints,
             todayUsd,
-            previousUsd,
             { currency, setCurrency: setDisplayCurrency },
           )
 
@@ -1834,7 +1780,7 @@ const definition = Plugin.define({
             icon: "status",
             tone: state.ok ? undefined : "danger",
             title: spend
-              ? `${balanceLabel} · расход за всё время ${spend} · сегодня ${today}${previous ? ` · прошлая задача ${previous}` : ""}`
+              ? `${balanceLabel} · расход за всё время ${spend} · сегодня ${today}`
               : balanceLabel,
             rows,
           }
